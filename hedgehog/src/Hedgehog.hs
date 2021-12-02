@@ -130,6 +130,10 @@ module Hedgehog (
   , Action
   , Sequential(..)
   , Parallel(..)
+  , sequentialActions
+  , parallelPrefix
+  , parallelBranch1
+  , parallelBranch2
   , executeSequential
   , executeParallel
 
@@ -192,7 +196,7 @@ import           Hedgehog.Internal.Range (Range, Size(..))
 import           Hedgehog.Internal.Runner (check, recheck, checkSequential, checkParallel)
 import           Hedgehog.Internal.Seed (Seed(..))
 import           Hedgehog.Internal.State (Command(..), Callback(..))
-import           Hedgehog.Internal.State (Action, Sequential(..), Parallel(..))
+import           Hedgehog.Internal.State (Action, Sequential(..), Parallel(..), sequentialActions, parallelPrefix, parallelBranch1, parallelBranch2)
 import           Hedgehog.Internal.State (executeSequential, executeParallel)
 import           Hedgehog.Internal.State (Var(..), Symbolic, Concrete(..), concrete, opaque)
 import           Hedgehog.Internal.TH (discover, discoverPrefix)

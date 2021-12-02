@@ -13,6 +13,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TupleSections #-}
 module Hedgehog.Internal.State (
   -- * Variables
     Var(..)
@@ -41,6 +42,10 @@ module Hedgehog.Internal.State (
   , Action(..)
   , Sequential(..)
   , Parallel(..)
+  , sequentialActions
+  , parallelPrefix
+  , parallelBranch1
+  , parallelBranch2
   , takeVariables
   , variablesOK
   , dropInvalid
@@ -515,9 +520,12 @@ contextNewVar = do
 -- | Drops invalid actions from the sequence.
 --
 dropInvalid :: [Action m state] -> State (Context state) [Action m state]
-dropInvalid =
+dropInvalid as = fmap (fmap fst) $ dropInvalid' ((,()) <$> as)
+
+dropInvalid' :: [(Action m state, a)] -> State (Context state) [(Action m state, a)]
+dropInvalid' =
   let
-    loop step@(Action input output _execute require update _ensure) = do
+    loop step@(Action input output _execute require update _ensure, _) = do
       Context state0 vars0 <- get
 
       if require state0 input && variablesOK input vars0 then do
@@ -541,7 +549,13 @@ action ::
      (MonadGen gen, MonadTest m)
   => [Command gen m state]
   -> GenT (StateT (Context state) (GenBase gen)) (Action m state)
-action commands =
+action = fmap fst . action'
+
+action' ::
+     (MonadGen gen, MonadTest m)
+  => [Command gen m state]
+  -> GenT (StateT (Context state) (GenBase gen)) (Action m state, state Symbolic)
+action' commands =
   Gen.justT $ do
     Context state0 _ <- get
 
@@ -561,33 +575,36 @@ action commands =
     else do
       output <- contextNewVar
 
-      contextUpdate $
-        callbackUpdate callbacks state0 input (Var output)
+      let state1 =  callbackUpdate callbacks state0 input (Var output)
+      contextUpdate $ state1
 
       pure . Just $
-        Action input output exec
+        (Action input output exec
           (callbackRequire callbacks)
           (callbackUpdate callbacks)
-          (callbackEnsure callbacks)
+          (callbackEnsure callbacks), state1)
 
 genActions ::
      (MonadGen gen, MonadTest m)
   => Range Int
   -> [Command gen m state]
   -> Context state
-  -> gen ([Action m state], Context state)
+  -> gen ([(Action m state, state Symbolic)], Context state)
 genActions range commands ctx = do
-  xs <- Gen.fromGenT . (`evalStateT` ctx) . distributeT $ Gen.list range (action commands)
+  xs <- Gen.fromGenT . (`evalStateT` ctx) . distributeT $ Gen.list range (action' commands)
   pure $
-    dropInvalid xs `runState` ctx
+    dropInvalid' xs `runState` ctx
 
 -- | A sequence of actions to execute.
 --
 newtype Sequential m state =
   Sequential {
       -- | The sequence of actions.
-      sequentialActions :: [Action m state]
+      sequentialActionsAndStates :: [(Action m state, state Symbolic)]
     }
+
+sequentialActions :: Sequential m state -> [Action m state]
+sequentialActions = fmap fst . sequentialActionsAndStates
 
 renderAction :: Action m state -> [String]
 renderAction (Action input (Symbolic (Name output)) _ _ _ _) =
@@ -634,8 +651,8 @@ renderActionResult env (Action _ output@(Symbolic (Name name)) _ _ _ _) =
 
 -- FIXME we should not abuse Show to get nice output for actions
 instance Show (Sequential m state) where
-  show (Sequential xs) =
-    unlines $ concatMap renderAction xs
+  show xs =
+    unlines $ concatMap renderAction $ sequentialActions xs
 
 -- | Generates a sequence of actions from an initial model state and set of commands.
 --
@@ -654,14 +671,24 @@ sequential range initial commands =
 data Parallel m state =
   Parallel {
       -- | The sequential prefix.
-      parallelPrefix :: [Action m state]
+      parallelPrefixAndStates :: [(Action m state, state Symbolic)]
 
       -- | The first branch.
-    , parallelBranch1 :: [Action m state]
+    , parallelBranch1AndStates :: [(Action m state, state Symbolic)]
 
       -- | The second branch.
-    , parallelBranch2 :: [Action m state]
+    , parallelBranch2AndStates :: [(Action m state, state Symbolic)]
     }
+
+parallelPrefix :: Parallel m state -> [Action m state]
+parallelPrefix = fmap fst . parallelPrefixAndStates
+
+parallelBranch1 :: Parallel m state -> [Action m state]
+parallelBranch1 = fmap fst . parallelBranch1AndStates
+
+parallelBranch2 :: Parallel m state -> [Action m state]
+parallelBranch2 = fmap fst . parallelBranch2AndStates
+
 
 -- FIXME we should not abuse Show to get nice output for actions
 instance Show (Parallel m state) where
@@ -669,14 +696,14 @@ instance Show (Parallel m state) where
     renderParallel renderAction
 
 renderParallel :: (Action m state -> [String]) -> Parallel m state -> String
-renderParallel render (Parallel pre xs ys) =
+renderParallel render p =
   unlines $ concat [
       ["━━━ Prefix ━━━"]
-    , concatMap render pre
+    , concatMap render (parallelPrefix p)
     , ["", "━━━ Branch 1 ━━━"]
-    , concatMap render xs
+    , concatMap render (parallelBranch1 p)
     , ["", "━━━ Branch 2 ━━━"]
-    , concatMap render ys
+    , concatMap render (parallelBranch2 p)
     ]
 
 
@@ -762,9 +789,9 @@ executeSequential ::
   => (forall v. state v)
   -> Sequential m state
   -> m ()
-executeSequential initial (Sequential xs) =
+executeSequential initial xs =
   withFrozenCallStack $ evalM $
-    foldM_ executeUpdateEnsure (initial, emptyEnvironment) xs
+    foldM_ executeUpdateEnsure (initial, emptyEnvironment) (sequentialActions xs)
 
 successful :: Test () -> Bool
 successful x =
@@ -826,14 +853,14 @@ executeParallel ::
   => (forall v. state v)
   -> Parallel m state
   -> m ()
-executeParallel initial p@(Parallel prefix branch1 branch2) =
+executeParallel initial p =
   withFrozenCallStack $ evalM $ do
-    (s0, env0) <- foldM executeUpdateEnsure (initial, emptyEnvironment) prefix
+    (s0, env0) <- foldM executeUpdateEnsure (initial, emptyEnvironment) (parallelPrefix p)
 
     ((xs, env1), (ys, env2)) <-
       Async.concurrently
-        (runStateT (traverse execute branch1) env0)
-        (runStateT (traverse execute branch2) env0)
+        (runStateT (traverse execute (parallelBranch1 p)) env0)
+        (runStateT (traverse execute (parallelBranch2 p)) env0)
 
     let
       env = unionsEnvironment [env0, env1, env2]
